@@ -290,9 +290,9 @@ Return ONLY JSON:
                 array_keys($this->categories), $this->categories
             ));
 
-            $prompt = "Categorize this menu item: '{$name}' (Description: '{$desc}')
+            $prompt = "Categorize this menu item: '{$name}' (Description text from menu: '{$desc}')
 
-Available Categories:
+Available Categories (IDs):
 {$categoriesText}
 
 Available Attributes:
@@ -307,7 +307,8 @@ Return ONLY this JSON:
 {
   \"category_id\": 39,
   \"attribute_id\": 2,
-  \"variation_ids\": [1,2]
+  \"variation_ids\": [1, 2],
+  \"description_120\": \"A concise, neutral, factual description <= 120 chars (no emojis, no marketing).\"
 }";
 
             $res = Http::withHeaders([
@@ -340,6 +341,13 @@ Return ONLY this JSON:
                         'variation_ids'  => array_values(array_unique(array_map('intval', $ai['variation_ids'] ?? [2]))),
                         'variation_names'=> array_map(fn($id) => $this->variations[(int)$id] ?? 'Unknown', $ai['variation_ids'] ?? [2]),
                     ];
+
+                    $aiDesc = '';
+                    if (!empty($ai['description_120']) && is_string($ai['description_120'])) {
+                        $aiDesc = $this->clamp120($ai['description_120']);
+                    }
+                    $item['ai_description'] = $aiDesc;
+
                     return $item;
                 }
             }
@@ -367,6 +375,55 @@ Return ONLY this JSON:
             'variation_ids'  => [1,2],
             'variation_names'=> ['Half Plate','Full Plate'],
         ];
+        $item['ai_description'] = ''; 
         return $item;
     }
+
+
+    private function clamp120(string $text): string
+{
+    $text = trim(preg_replace('/\s+/', ' ', (string) $text));
+    if (function_exists('mb_strwidth')) {
+        if (mb_strwidth($text, 'UTF-8') > 120) {
+            $text = rtrim(mb_strimwidth($text, 0, 120, '', 'UTF-8'));
+        }
+    } else {
+        if (strlen($text) > 120) {
+            $text = rtrim(substr($text, 0, 120));
+        }
+    }
+    return $text;
+}
+
+
+    /**
+     * Build a concise description (<= 120 chars). If empty, compose a fallback.
+     */
+    private function shortDescription(string $desc, array $ai, string $name): string
+    {
+        // normalize whitespace
+        $desc = trim(preg_replace('/\s+/', ' ', (string) $desc));
+
+        // compose fallback if missing
+        if ($desc === '') {
+            $cat  = $ai['category_name']  ?? ($this->categories[$ai['category_id'] ?? 71] ?? 'Menu Item');
+            $attr = $ai['attribute_name'] ?? ($this->attributes[$ai['attribute_id'] ?? 1] ?? 'Veg');
+            $desc = "{$name} — {$attr} • {$cat}";
+        }
+
+        // multibyte-safe clamp at 120 chars
+        if (function_exists('mb_strwidth')) {
+            if (mb_strwidth($desc, 'UTF-8') > 120) {
+                $desc = rtrim(mb_strimwidth($desc, 0, 120, '', 'UTF-8'));
+            }
+        } else {
+            if (strlen($desc) > 120) {
+                $desc = rtrim(substr($desc, 0, 120));
+            }
+        }
+
+        return $desc;
+    }
+
+
 }
