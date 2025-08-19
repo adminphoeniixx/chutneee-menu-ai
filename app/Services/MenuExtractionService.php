@@ -130,6 +130,11 @@ class MenuExtractionService
 
     /* ==================== Internals ==================== */
 
+    private function computeAllowVariation(array $item): int
+{
+    return 0;
+}
+
     private function row(int $id, array $ai, string $name, float $price, string $desc, ?int $variationId): array
     {
         $allow = $variationId === null ? 1 : 0;
@@ -553,6 +558,7 @@ Return ONLY this JSON:
                         $aiDesc = $this->clamp120($ai['description_120']);
                     }
                     $item['ai_description'] = $aiDesc;
+                    $item['allowvariation'] = $this->computeAllowVariation($item);
 
                     return $item;
                 }
@@ -582,6 +588,7 @@ Return ONLY this JSON:
             'variation_names'=> ['Half Plate','Full Plate'],
         ];
         $item['ai_description'] = ''; 
+        $item['allowvariation'] = $this->computeAllowVariation($item);
         return $item;
     }
 
