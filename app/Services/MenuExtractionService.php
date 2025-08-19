@@ -558,7 +558,7 @@ Return ONLY this JSON:
                         $aiDesc = $this->clamp120($ai['description_120']);
                     }
                     $item['ai_description'] = $aiDesc;
-                    $item['allowvariation'] = $this->computeAllowVariation($item);
+                    $item['allowvariation'] = (count($item['ai_category']['variation_ids'] ?? []) > 1) ? 1 : 0;
 
                     return $item;
                 }
@@ -588,7 +588,7 @@ Return ONLY this JSON:
             'variation_names'=> ['Half Plate','Full Plate'],
         ];
         $item['ai_description'] = ''; 
-        $item['allowvariation'] = $this->computeAllowVariation($item);
+         $item['allowvariation'] = (count($item['ai_category']['variation_ids'] ?? []) > 1) ? 1 : 0;
         return $item;
     }
 
