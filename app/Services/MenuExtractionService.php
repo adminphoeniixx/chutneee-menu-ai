@@ -60,10 +60,13 @@ class MenuExtractionService
         $this->validateImage($image);
 
         // 1) Vision extract
-        $base64 = $this->toBase64($image);
-        $mime   = $image->getMimeType() ?: 'image/jpeg';
+        $jpegBytes = $this->preprocessImageToJpeg($image, 1600, 75);
+        $base64    = base64_encode($jpegBytes);
+        $mime      = 'image/jpeg';
 
         $raw = $this->callOpenRouterVision($base64, $mime);
+
+        Log::info('Raw vision output', ['raw' => $raw]);
 
         // 2) Normalize extracted JSON
         $menu = $this->normalizeExtracted($raw);
@@ -171,90 +174,293 @@ class MenuExtractionService
         return base64_encode(file_get_contents($image->getRealPath()));
     }
 
+    /**
+ * Preprocess the uploaded menu image:
+ * - auto-orient (EXIF)
+ * - downscale (max width)
+ * - light sharpen
+ * - strip metadata
+ * - encode JPEG @ quality
+ *
+ * Returns raw JPEG bytes.
+ */
+private function preprocessImageToJpeg(UploadedFile $image, int $maxWidth = 1600, int $quality = 75): string
+{
+    if (extension_loaded('imagick')) {
+        $img = new \Imagick($image->getRealPath());
+
+        // If multi-frame (e.g., GIF/PDF), use first frame
+        if ($img->getNumberImages() > 1) {
+            $img = $img->coalesceImages();
+            $img->setIteratorIndex(0);
+        }
+
+        // Auto-orient
+        if (method_exists($img, 'autoOrient')) {
+            $img->autoOrient();
+        } elseif (method_exists($img, 'setImageOrientation')) {
+            $img->setImageOrientation(\Imagick::ORIENTATION_TOPLEFT);
+        }
+
+        // Downscale
+        $w = $img->getImageWidth();
+        $h = $img->getImageHeight();
+        if ($w > $maxWidth) {
+            $newH = (int) round($h * ($maxWidth / $w));
+            $img->resizeImage($maxWidth, $newH, \Imagick::FILTER_LANCZOS, 1);
+        }
+
+        // Light sharpen
+        $img->sharpenImage(0.0, 0.6);
+
+        // Strip metadata and encode
+        $img->stripImage();
+        $img->setImageFormat('jpeg');
+        $img->setImageCompression(\Imagick::COMPRESSION_JPEG);
+        $img->setImageCompressionQuality($quality);
+
+        return (string) $img;
+    }
+
+    // ---- GD fallback ----
+    $bytes = file_get_contents($image->getRealPath());
+    $src = @imagecreatefromstring($bytes);
+    if (!$src) {
+        return $bytes; // fallback to original if GD fails
+    }
+
+    // Best-effort EXIF orientation (JPEG only)
+    $ext = strtolower($image->getClientOriginalExtension());
+    if (function_exists('exif_read_data') && in_array($ext, ['jpg','jpeg'], true)) {
+        $exif = @exif_read_data($image->getRealPath());
+        if (!empty($exif['Orientation'])) {
+            switch ($exif['Orientation']) {
+                case 3: $src = imagerotate($src, 180, 0); break;
+                case 6: $src = imagerotate($src, -90, 0); break;
+                case 8: $src = imagerotate($src, 90, 0); break;
+            }
+        }
+    }
+
+    $w = imagesx($src); $h = imagesy($src);
+    if ($w > $maxWidth) {
+        $nh  = (int) round($h * ($maxWidth / $w));
+        $dst = imagecreatetruecolor($maxWidth, $nh);
+        // white bg for formats with alpha
+        imagefill($dst, 0, 0, imagecolorallocate($dst, 255, 255, 255));
+        imagecopyresampled($dst, $src, 0, 0, 0, 0, $maxWidth, $nh, $w, $h);
+        imagedestroy($src);
+        $src = $dst;
+    }
+
+    // Light sharpen kernel
+    $matrix  = [[-1,-1,-1],[-1,16,-1],[-1,-1,-1]];
+    $divisor = 8; $offset = 0;
+    @imageconvolution($src, $matrix, $divisor, $offset);
+
+    ob_start();
+    imagejpeg($src, null, $quality);
+    $out = (string) ob_get_clean();
+    imagedestroy($src);
+
+    return $out;
+}
+
     private function callOpenRouterVision(string $b64, string $mime): string
-    {
-        $payload = [
-            'model' => $this->model,
-            'messages' => [[
+{
+    $payload = [
+        'model' => $this->model, // e.g. openai/gpt-4o  (vision-capable)
+        'response_format' => ['type' => 'json_object'], // <- force a single JSON object
+        'messages' => [
+            [
+                'role' => 'system',
+                'content' => 'You are an OCR + structuring engine. Return ONE valid JSON object only. Do NOT include markdown or code fences.'
+            ],
+            [
                 'role' => 'user',
                 'content' => [
                     [
                         'type' => 'text',
-                        'text' => 'Extract ALL menu items from this image with names, descriptions, and pricing.
-Return ONLY JSON:
-{
-  "restaurant_name": "Restaurant name",
-  "menu_sections": [
-    {
-      "section_name": "Section name",
-      "items": [
-        {
-          "name": "Item name",
-          "description": "Description",
-          "pricing": [
-            {"size": "Full", "price": "360", "currency": "₹"},
-            {"size": "Half", "price": "200", "currency": "₹"}
-          ]
-        }
-      ]
-    }
-  ]
-}'
+                        'text' => 'Read ALL text from this restaurant menu image (small fonts, multi columns, split prices like "50 / 90").
+                        Convert into JSON ONLY with this schema:
+                        {
+                        "restaurant_name": "string",
+                        "menu_sections": [
+                            {
+                            "section_name": "string",
+                            "items": [
+                                {
+                                "name": "string",
+                                "description": "short (<=120 chars, invent if not visible)",
+                                "pricing": [
+                                    {"size": "Full|Half|Regular|Plain|etc", "price": "number as string", "currency": "₹"}
+                                ]
+                                }
+                            ]
+                            }
+                        ]
+                        }
+                        - Do not skip items.
+                        - If the JSON would be very long, you may shorten descriptions but keep all items.
+                        - Return ONLY the JSON object. No extra text.'
                     ],
                     [
                         'type' => 'image_url',
                         'image_url' => [
-                            'url' => "data:{$mime};base64,{$b64}",
-                            'detail' => 'high'
+                            'url' => "data:{$mime};base64,{$b64}" // no detail flag
                         ]
                     ]
                 ]
-            ]],
-            'max_tokens'  => 3000,
-            'temperature' => 0.0,
-        ];
+            ]
+        ],
+        'max_tokens'  => 8000, // give room; OpenRouter will cap as needed
+        'temperature' => 0.0,
+    ];
 
-        $res = Http::withHeaders([
-            'Authorization' => 'Bearer '.$this->apiKey,
-            'Content-Type'  => 'application/json',
-            'HTTP-Referer'  => request()->getSchemeAndHttpHost(),
-            'X-Title'       => 'Menu Extraction API',
-        ])->timeout($this->timeout)->post($this->baseUrl.'/chat/completions', $payload);
+    $res = Http::withHeaders([
+        'Authorization' => 'Bearer '.$this->apiKey,
+        'Content-Type'  => 'application/json',
+        'HTTP-Referer'  => request()->getSchemeAndHttpHost(),
+        'X-Title'       => 'Menu Extraction API',
+    ])->timeout($this->timeout)->post($this->baseUrl.'/chat/completions', $payload);
 
-        if (!$res->successful()) {
-            throw new \Exception('OpenRouter API error: '.$res->body());
-        }
-
-        $json = $res->json();
-        return $json['choices'][0]['message']['content'] ?? '';
+    if (!$res->successful()) {
+        throw new \Exception('OpenRouter API error: '.$res->body());
     }
+
+    $json = $res->json();
+    return $json['choices'][0]['message']['content'] ?? '';
+}
+
+
+
+    /**
+ * Remove code fences, illegal control chars, and ensure UTF-8 string.
+ */
+private function sanitizeJsonString(string $s): string
+{
+    // strip code fences if any slipped through
+    $s = preg_replace('/^```(?:json)?\s*/i', '', $s);
+    $s = preg_replace('/```$/', '', $s);
+
+    // normalize newlines, collapse weird whitespace
+    $s = str_replace(["\r\n", "\r"], "\n", $s);
+
+    // remove illegal ASCII control chars except \n \t
+    $s = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/u', '', $s);
+
+    // ensure valid UTF-8
+    if (!mb_detect_encoding($s, 'UTF-8', true)) {
+        $s = mb_convert_encoding($s, 'UTF-8', 'UTF-8');
+    }
+
+    return trim($s);
+}
+
+/**
+ * Try to cut the string to the longest balanced JSON object substring { ... }.
+ */
+private function cutToBalancedJsonObject(string $s): ?string
+{
+    $start = strpos($s, '{');
+    if ($start === false) return null;
+
+    $depth = 0;
+    $inStr = false;
+    $prev  = '';
+    $lastBalancedPos = null;
+
+    $len = strlen($s);
+    for ($i = $start; $i < $len; $i++) {
+        $ch = $s[$i];
+
+        if ($inStr) {
+            if ($ch === '"' && $prev !== '\\') {
+                $inStr = false;
+            }
+        } else {
+            if ($ch === '"') {
+                $inStr = true;
+            } elseif ($ch === '{') {
+                $depth++;
+            } elseif ($ch === '}') {
+                $depth--;
+                if ($depth === 0) {
+                    $lastBalancedPos = $i;
+                    break; // we found a full top-level JSON object
+                }
+            }
+        }
+        $prev = $ch;
+    }
+
+    if ($lastBalancedPos !== null) {
+        return substr($s, $start, $lastBalancedPos - $start + 1);
+    }
+
+    // If we didn't close, try a softer cut at the last '}' seen
+    $lastBrace = strrpos($s, '}');
+    if ($lastBrace !== false && $lastBrace > $start) {
+        return substr($s, $start, $lastBrace - $start + 1);
+    }
+
+    return null;
+}
+
+
+
 
     private function normalizeExtracted(string $raw): array
-    {
-        // Strip code fences and isolate JSON block
-        $clean = trim(preg_replace('/```json\s*|\s*```/i', '', $raw));
-        $first = strpos($clean, '{'); 
-        $last  = strrpos($clean, '}');
-        if ($first !== false && $last !== false && $last >= $first) {
-            $clean = substr($clean, $first, $last - $first + 1);
-        }
+{
+    // 1) Sanitize
+    $clean = $this->sanitizeJsonString($raw);
 
-        $decoded = json_decode($clean, true);
-        if (json_last_error() === JSON_ERROR_NONE && isset($decoded['menu_sections']) && is_array($decoded['menu_sections'])) {
-            // Ensure schema pieces exist
-            $decoded['restaurant_name'] = $decoded['restaurant_name'] ?? 'Restaurant Menu';
-            return $decoded;
+    // 2) Try decode as-is
+    $decoded = json_decode($clean, true);
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        // 3) Try cut to balanced { ... }
+        $balanced = $this->cutToBalancedJsonObject($clean);
+        if ($balanced !== null) {
+            $decoded = json_decode($balanced, true);
         }
+    }
 
-        // Fallback minimal skeleton (still return array)
-        Log::warning('Vision JSON parse failed; returning skeleton.', ['error' => json_last_error_msg()]);
+    if (json_last_error() !== JSON_ERROR_NONE || !is_array($decoded)) {
+        Log::warning('Vision JSON parse failed after repair', [
+            'error' => json_last_error_msg(),
+            'snippet' => substr($clean, 0, 600).'...'
+        ]);
         return [
             'restaurant_name' => 'Restaurant Menu',
-            'menu_sections' => [
-                ['section_name' => 'Menu Items', 'items' => []]
-            ]
+            'menu_sections'   => [['section_name' => 'Menu Items', 'items' => []]],
         ];
     }
+
+    // Accept either format
+    if (isset($decoded['items']) && is_array($decoded['items'])) {
+        return [
+            'restaurant_name' => $decoded['restaurant_name'] ?? 'Restaurant Menu',
+            'menu_sections'   => [[
+                'section_name' => 'Menu Items',
+                'items'        => $decoded['items'],
+            ]]
+        ];
+    }
+
+    if (isset($decoded['menu_sections']) && is_array($decoded['menu_sections'])) {
+        $decoded['restaurant_name'] = $decoded['restaurant_name'] ?? 'Restaurant Menu';
+        return $decoded;
+    }
+
+    // Fallback skeleton
+    return [
+        'restaurant_name' => 'Restaurant Menu',
+        'menu_sections'   => [['section_name' => 'Menu Items', 'items' => []]],
+    ];
+}
+
+
+
 
     private function enhanceWithAI(array $menuData): array
     {
