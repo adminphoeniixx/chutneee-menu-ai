@@ -27,6 +27,8 @@ class ImageGenController extends Controller
     $seed         = (string)($data['seed'] ?? 5);
     $prefix       = trim($data['path_prefix'] ?? 'menu', '/');
 
+    $prompt = "Realistic food photo: ".$prompt." served on a single plate, freshly prepared, on a wooden table, natural lighting, shallow depth of field, delivery app style presentation. No text, no watermark.";
+
     // --- 1) Call Vyro/Imagine with plain multipart *fields* (no attach) ---
     try {
         $ai = Http::timeout(180)
